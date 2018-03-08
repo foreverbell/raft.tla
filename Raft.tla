@@ -23,6 +23,7 @@ CONSTANTS RequestVoteRequest, RequestVoteResponse,
 \* Maximum number of client requests.
 CONSTANTS MaxClientRequests
 
+\* Maximum permitted term.
 CONSTANTS MaxTerm
 
 -------------------------------------------------------------------------------
@@ -322,7 +323,8 @@ HandleAppendEntriesRequest(i, j, m) ==
              /\ LET index == m.mprevLogIndex + 1
                 IN \/ \* already done with request
                        /\ \/ m.mentries = << >>
-                          \/ /\ Len(log[i]) >= index
+                          \/ /\ m.mentries /= << >>
+                             /\ Len(log[i]) >= index
                              /\ log[i][index].term = m.mentries[1].term
                           \* This could make our commitIndex decrease (for
                           \* example if we process an old, duplicated request),
@@ -337,7 +339,7 @@ HandleAppendEntriesRequest(i, j, m) ==
                                  msource         |-> i,
                                  mdest           |-> j],
                                  m)
-                       /\ UNCHANGED <<serverVars, logVars>>
+                       /\ UNCHANGED <<serverVars, log, clientRequests>>
                    \/ \* conflict: remove 1 entry
                        /\ m.mentries /= << >>
                        /\ Len(log[i]) >= index
@@ -411,9 +413,9 @@ Next == \/ \E i \in Server : Restart(i)
         \/ \E i \in Server : Timeout(i)
         \/ \E i,j \in Server : RequestVote(i, j)
         \/ \E i \in Server : BecomeLeader(i)
-        \* \/ \E i \in Server : ClientRequest(i)
-        \* \/ \E i \in Server : AdvanceCommitIndex(i)
-        \* \/ \E i,j \in Server : AppendEntries(i, j)
+        \/ \E i \in Server : ClientRequest(i)
+        \/ \E i \in Server : AdvanceCommitIndex(i)
+        \/ \E i,j \in Server : AppendEntries(i, j)
         \/ \E m \in messages : Receive(m)
 
 \* The specification must start with the initial state and transition according
