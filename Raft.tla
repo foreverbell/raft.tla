@@ -1,4 +1,4 @@
---------------------------------- MODULE raft ---------------------------------
+--------------------------------- MODULE Raft ---------------------------------
 \* This is the formal specification for the Raft consensus algorithm.
 \*
 \* Copyright 2014 Diego Ongaro.
@@ -7,11 +7,8 @@
 
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
-\* The set of server IDs
+\* The set of server IDs.
 CONSTANTS Server
-
-\* The set of requests that can go into the log
-CONSTANTS Value
 
 \* Server states.
 CONSTANTS Follower, Candidate, Leader
@@ -23,27 +20,19 @@ CONSTANTS Nil
 CONSTANTS RequestVoteRequest, RequestVoteResponse,
           AppendEntriesRequest, AppendEntriesResponse
 
-----
+\* Maximum number of client requests.
+CONSTANTS MaxClientRequests
+
+CONSTANTS MaxTerm
+
+-------------------------------------------------------------------------------
 \* Global variables
 
-\* A bag of records representing requests and responses sent from one server
-\* to another. TLAPS doesn't support the Bags module, so this is a function
-\* mapping Message to Nat.
+\* A set of records representing requests and responses sent from one server
+\* to another.
 VARIABLE messages
 
-\* A history variable used in the proof. This would not be present in an
-\* implementation.
-\* Keeps track of successful elections, including the initial logs of the
-\* leader and voters' logs. Set of functions containing various things about
-\* successful elections (see BecomeLeader).
-VARIABLE elections
-
-\* A history variable used in the proof. This would not be present in an
-\* implementation.
-\* Keeps track of every log ever in the system (set of logs).
-VARIABLE allLogs
-
-----
+-------------------------------------------------------------------------------
 \* The following variables are all per server (functions with domain Server).
 
 \* The server's term number.
@@ -61,7 +50,9 @@ serverVars == <<currentTerm, state, votedFor>>
 VARIABLE log
 \* The index of the latest entry in the log the state machine may apply.
 VARIABLE commitIndex
-logVars == <<log, commitIndex>>
+\* The set of requests that can go into the log.
+VARIABLE clientRequests
+logVars == <<log, commitIndex, clientRequests>>
 
 \* The following variables are used only on candidates:
 \* The set of servers from which the candidate has received a RequestVote
@@ -70,12 +61,7 @@ VARIABLE votesResponded
 \* The set of servers from which the candidate has received a vote in its
 \* currentTerm.
 VARIABLE votesGranted
-\* A history variable used in the proof. This would not be present in an
-\* implementation.
-\* Function from each server that voted for this candidate in its currentTerm
-\* to that voter's log.
-VARIABLE voterLog
-candidateVars == <<votesResponded, votesGranted, voterLog>>
+candidateVars == <<votesResponded, votesGranted>>
 
 \* The following variables are used only on leaders:
 \* The next entry to send to each follower.
@@ -83,46 +69,43 @@ VARIABLE nextIndex
 \* The latest entry that each follower has acknowledged is the same as the
 \* leader's. This is used to calculate commitIndex on the leader.
 VARIABLE matchIndex
-leaderVars == <<nextIndex, matchIndex, elections>>
+leaderVars == <<nextIndex, matchIndex>>
 
 \* End of per server variables.
-----
+-------------------------------------------------------------------------------
 
 \* All variables; used for stuttering (asserting state hasn't changed).
-vars == <<messages, allLogs, serverVars, candidateVars, leaderVars, logVars>>
+vars == <<messages, serverVars, candidateVars, leaderVars, logVars>>
 
-----
+-------------------------------------------------------------------------------
 \* Helpers
 
-\* The set of all quorums. This just calculates simple majorities, but the only
-\* important property is that every quorum overlaps with every other.
-Quorum == {i \in SUBSET(Server) : Cardinality(i) * 2 > Cardinality(Server)}
+\* Return true if the server set is a quorum. This just calculates simple
+\* majorities, but the only important property is that every quorum overlaps
+\* with every other.
+IsQuorum(svrs) == Cardinality(svrs) * 2 > Cardinality(Server)
 
 \* The term of the last entry in a log, or 0 if the log is empty.
 LastTerm(xlog) == IF Len(xlog) = 0 THEN 0 ELSE xlog[Len(xlog)].term
 
-\* Helper for Send and Reply. Given a message m and bag of messages, return a
-\* new bag of messages with one more m in it.
+\* Helper for Send and Reply. Given a message m and set of messages, return a
+\* new set of messages with one m in it.
 WithMessage(m, msgs) ==
-    IF m \in DOMAIN msgs THEN
-        [msgs EXCEPT ![m] = msgs[m] + 1]
-    ELSE
-        msgs @@ (m :> 1)
+    msgs \cup {m}
 
-\* Helper for Discard and Reply. Given a message m and bag of messages, return
-\* a new bag of messages with one less m in it.
+\* Helper for Discard and Reply. Given a message m and set of messages, return
+\* a new set of messages with no m in it.
 WithoutMessage(m, msgs) ==
-    IF m \in DOMAIN msgs THEN
-        [msgs EXCEPT ![m] = msgs[m] - 1]
-    ELSE
-        msgs
+    msgs \ {m}
 
-\* Add a message to the bag of messages.
-Send(m) == messages' = WithMessage(m, messages)
+\* Add a message to the set of messages.
+Send(m) ==
+    messages' = WithMessage(m, messages)
 
-\* Remove a message from the bag of messages. Used when a server is done
+\* Remove a message from the set of messages. Used when a server is done
 \* processing a message.
-Discard(m) == messages' = WithoutMessage(m, messages)
+Discard(m) ==
+    messages' = WithoutMessage(m, messages)
 
 \* Combination of Send and Discard
 Reply(response, request) ==
@@ -133,12 +116,9 @@ Min(s) == CHOOSE x \in s : \A y \in s : x <= y
 \* Return the maximum value from a set, or undefined if the set is empty.
 Max(s) == CHOOSE x \in s : \A y \in s : x >= y
 
-----
+-------------------------------------------------------------------------------
 \* Define initial values for all variables
 
-InitHistoryVars == /\ elections = {}
-                   /\ allLogs   = {}
-                   /\ voterLog  = [i \in Server |-> [j \in {} |-> <<>>]]
 InitServerVars == /\ currentTerm = [i \in Server |-> 1]
                   /\ state       = [i \in Server |-> Follower]
                   /\ votedFor    = [i \in Server |-> Nil]
@@ -149,16 +129,16 @@ InitCandidateVars == /\ votesResponded = [i \in Server |-> {}]
 \* in the functions.
 InitLeaderVars == /\ nextIndex  = [i \in Server |-> [j \in Server |-> 1]]
                   /\ matchIndex = [i \in Server |-> [j \in Server |-> 0]]
-InitLogVars == /\ log          = [i \in Server |-> << >>]
-               /\ commitIndex  = [i \in Server |-> 0]
-Init == /\ messages = [m \in {} |-> 0]
-        /\ InitHistoryVars
+InitLogVars == /\ log            = [i \in Server |-> << >>]
+               /\ commitIndex    = [i \in Server |-> 0]
+               /\ clientRequests = 0
+Init == /\ messages = {}
         /\ InitServerVars
         /\ InitCandidateVars
         /\ InitLeaderVars
         /\ InitLogVars
 
-----
+-------------------------------------------------------------------------------
 \* Define state transitions
 
 \* Server i restarts from stable storage.
@@ -167,14 +147,14 @@ Restart(i) ==
     /\ state'          = [state EXCEPT ![i] = Follower]
     /\ votesResponded' = [votesResponded EXCEPT ![i] = {}]
     /\ votesGranted'   = [votesGranted EXCEPT ![i] = {}]
-    /\ voterLog'       = [voterLog EXCEPT ![i] = [j \in {} |-> <<>>]]
     /\ nextIndex'      = [nextIndex EXCEPT ![i] = [j \in Server |-> 1]]
     /\ matchIndex'     = [matchIndex EXCEPT ![i] = [j \in Server |-> 0]]
     /\ commitIndex'    = [commitIndex EXCEPT ![i] = 0]
-    /\ UNCHANGED <<messages, currentTerm, votedFor, log, elections>>
+    /\ UNCHANGED <<messages, currentTerm, votedFor, log, clientRequests>>
 
 \* Server i times out and starts a new election.
-Timeout(i) == /\ state[i] \in {Follower, Candidate}
+Timeout(i) == /\ currentTerm[i] < MaxTerm
+              /\ state[i] \in {Follower, Candidate}
               /\ state' = [state EXCEPT ![i] = Candidate]
               /\ currentTerm' = [currentTerm EXCEPT ![i] = currentTerm[i] + 1]
               \* Most implementations would probably just set the local vote
@@ -182,7 +162,6 @@ Timeout(i) == /\ state[i] \in {Follower, Candidate}
               /\ votedFor' = [votedFor EXCEPT ![i] = Nil]
               /\ votesResponded' = [votesResponded EXCEPT ![i] = {}]
               /\ votesGranted'   = [votesGranted EXCEPT ![i] = {}]
-              /\ voterLog'       = [voterLog EXCEPT ![i] = [j \in {} |-> <<>>]]
               /\ UNCHANGED <<messages, leaderVars, logVars>>
 
 \* Candidate i sends j a RequestVote request.
@@ -216,9 +195,6 @@ AppendEntries(i, j) ==
                 mprevLogIndex  |-> prevLogIndex,
                 mprevLogTerm   |-> prevLogTerm,
                 mentries       |-> entries,
-                \* mlog is used as a history variable for the proof.
-                \* It would not exist in a real implementation.
-                mlog           |-> log[i],
                 mcommitIndex   |-> Min({commitIndex[i], lastEntry}),
                 msource        |-> i,
                 mdest          |-> j])
@@ -227,27 +203,23 @@ AppendEntries(i, j) ==
 \* Candidate i transitions to leader.
 BecomeLeader(i) ==
     /\ state[i] = Candidate
-    /\ votesGranted[i] \in Quorum
+    /\ IsQuorum(votesGranted[i])
     /\ state'      = [state EXCEPT ![i] = Leader]
     /\ nextIndex'  = [nextIndex EXCEPT ![i] =
                          [j \in Server |-> Len(log[i]) + 1]]
     /\ matchIndex' = [matchIndex EXCEPT ![i] =
                          [j \in Server |-> 0]]
-    /\ elections'  = elections \cup
-                         {[eterm     |-> currentTerm[i],
-                           eleader   |-> i,
-                           elog      |-> log[i],
-                           evotes    |-> votesGranted[i],
-                           evoterLog |-> voterLog[i]]}
     /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
 
-\* Leader i receives a client request to add v to the log.
-ClientRequest(i, v) ==
+\* Leader i receives a client request to add it to the log.
+ClientRequest(i) ==
     /\ state[i] = Leader
+    /\ clientRequests < MaxClientRequests
     /\ LET entry == [term  |-> currentTerm[i],
-                     value |-> v]
+                     value |-> clientRequests]
            newLog == Append(log[i], entry)
-       IN  log' = [log EXCEPT ![i] = newLog]
+       IN  /\ log' = [log EXCEPT ![i] = newLog]
+           /\ clientRequests' = clientRequests + 1
     /\ UNCHANGED <<messages, serverVars, candidateVars,
                    leaderVars, commitIndex>>
 
@@ -262,7 +234,7 @@ AdvanceCommitIndex(i) ==
                                          matchIndex[i][k] >= index}
            \* The maximum indexes for which a quorum agrees
            agreeIndexes == {index \in 1..Len(log[i]) :
-                                Agree(index) \in Quorum}
+                                IsQuorum(Agree(index))}
            \* New value for commitIndex'[i]
            newCommitIndex ==
               IF /\ agreeIndexes /= {}
@@ -272,9 +244,10 @@ AdvanceCommitIndex(i) ==
               ELSE
                   commitIndex[i]
        IN commitIndex' = [commitIndex EXCEPT ![i] = newCommitIndex]
-    /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log>>
+    /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log,
+                   clientRequests>>
 
-----
+-------------------------------------------------------------------------------
 \* Message handlers
 \* i = recipient, j = sender, m = message
 
@@ -293,9 +266,6 @@ HandleRequestVoteRequest(i, j, m) ==
        /\ Reply([mtype        |-> RequestVoteResponse,
                  mterm        |-> currentTerm[i],
                  mvoteGranted |-> grant,
-                 \* mlog is used just for the `elections' history variable for
-                 \* the proof. It would not exist in a real implementation.
-                 mlog         |-> log[i],
                  msource      |-> i,
                  mdest        |-> j],
                  m)
@@ -312,10 +282,8 @@ HandleRequestVoteResponse(i, j, m) ==
     /\ \/ /\ m.mvoteGranted
           /\ votesGranted' = [votesGranted EXCEPT ![i] =
                                   votesGranted[i] \cup {j}]
-          /\ voterLog' = [voterLog EXCEPT ![i] =
-                              voterLog[i] @@ (j :> m.mlog)]
        \/ /\ ~m.mvoteGranted
-          /\ UNCHANGED <<votesGranted, voterLog>>
+          /\ UNCHANGED <<votesGranted>>
     /\ Discard(m)
     /\ UNCHANGED <<serverVars, votedFor, leaderVars, logVars>>
 
@@ -377,13 +345,15 @@ HandleAppendEntriesRequest(i, j, m) ==
                        /\ LET new == [index2 \in 1..(Len(log[i]) - 1) |->
                                           log[i][index2]]
                           IN log' = [log EXCEPT ![i] = new]
-                       /\ UNCHANGED <<serverVars, commitIndex, messages>>
+                       /\ UNCHANGED <<serverVars, commitIndex, messages,
+                                      clientRequests>>
                    \/ \* no conflict: append entry
                        /\ m.mentries /= << >>
                        /\ Len(log[i]) = m.mprevLogIndex
                        /\ log' = [log EXCEPT ![i] =
                                       Append(log[i], m.mentries[1])]
-                       /\ UNCHANGED <<serverVars, commitIndex, messages>>
+                       /\ UNCHANGED <<serverVars, commitIndex, messages,
+                                      clientRequests>>
        /\ UNCHANGED <<candidateVars, leaderVars>>
 
 \* Server i receives an AppendEntries response from server j with
@@ -398,7 +368,7 @@ HandleAppendEntriesResponse(i, j, m) ==
                                Max({nextIndex[i][j] - 1, 1})]
           /\ UNCHANGED <<matchIndex>>
     /\ Discard(m)
-    /\ UNCHANGED <<serverVars, candidateVars, logVars, elections>>
+    /\ UNCHANGED <<serverVars, candidateVars, logVars>>
 
 \* Any RPC with a newer term causes the recipient to advance its term first.
 UpdateTerm(i, j, m) ==
@@ -434,37 +404,36 @@ Receive(m) ==
              \/ HandleAppendEntriesResponse(i, j, m)
 
 \* End of message handlers.
-----
-\* Network state transitions
 
-\* The network duplicates a message
-DuplicateMessage(m) ==
-    /\ Send(m)
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
-
-\* The network drops a message
-DropMessage(m) ==
-    /\ Discard(m)
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
-
-----
+-------------------------------------------------------------------------------
 \* Defines how the variables may transition.
-Next == /\ \/ \E i \in Server : Restart(i)
-           \/ \E i \in Server : Timeout(i)
-           \/ \E i,j \in Server : RequestVote(i, j)
-           \/ \E i \in Server : BecomeLeader(i)
-           \/ \E i \in Server, v \in Value : ClientRequest(i, v)
-           \/ \E i \in Server : AdvanceCommitIndex(i)
-           \/ \E i,j \in Server : AppendEntries(i, j)
-           \/ \E m \in DOMAIN messages : Receive(m)
-           \/ \E m \in DOMAIN messages : DuplicateMessage(m)
-           \/ \E m \in DOMAIN messages : DropMessage(m)
-           \* History variable that tracks every log ever:
-        /\ allLogs' = allLogs \cup {log[i] : i \in Server}
+Next == \/ \E i \in Server : Restart(i)
+        \/ \E i \in Server : Timeout(i)
+        \/ \E i,j \in Server : RequestVote(i, j)
+        \/ \E i \in Server : BecomeLeader(i)
+        \* \/ \E i \in Server : ClientRequest(i)
+        \* \/ \E i \in Server : AdvanceCommitIndex(i)
+        \* \/ \E i,j \in Server : AppendEntries(i, j)
+        \/ \E m \in messages : Receive(m)
 
 \* The specification must start with the initial state and transition according
 \* to Next.
 Spec == Init /\ [][Next]_vars
+
+OnlyOneLeader ==
+    LET BothLeader(i, j) ==
+            /\ i /= j
+            /\ currentTerm[i] = currentTerm[j]
+            /\ state[i] = Leader
+            /\ state[j] = Leader
+    IN \A i,j \in Server : ~BothLeader(i, j)
+
+WithinMaxTerm ==
+    \A i \in Server : currentTerm[i] <= MaxTerm
+
+THEOREM Safety ==
+  Spec => [](/\ OnlyOneLeader
+             /\ WithinMaxTerm)
 
 ===============================================================================
 
